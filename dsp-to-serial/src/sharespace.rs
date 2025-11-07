@@ -1,13 +1,13 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use nix::{errno::Errno, fcntl::{open, OFlag}, ioctl_readwrite_bad, sys::stat::Mode};
 
 use crate::util::wrap_ioctl_negative_invalid;
 
 #[repr(C)]
 #[derive(Default, Debug)]
-struct DebugMessage {
+pub struct DebugMessage {
     pub sys_cnt: u32,
     pub log_head_addr: u32,
     pub log_end_addr: u32,
@@ -33,16 +33,17 @@ pub struct DspSharespace {
     pub debug_msg: DebugMessage,
 }
 
-#[derive(Debug)]
-enum ChooseShareSpace {
+#[derive(Debug, Clone, Copy)]
+pub enum ChooseShareSpace {
     ChooseDspWriteSpace = 0,
     ChooseArmWriteSpace = 1,
+    ChooseLogSpace = 2,
 }
 
 ioctl_readwrite_bad!(read_debug_message, 0x01, DspSharespace);
 ioctl_readwrite_bad!(write_debug_message, 0x03, DspSharespace);
 
-fn choose_sharespace(
+pub fn choose_sharespace(
     fd: &OwnedFd,
     msg: &mut DspSharespace,
     choose: ChooseShareSpace,
@@ -53,7 +54,15 @@ fn choose_sharespace(
     msg.mmap_phy_addr = match choose {
         ChooseShareSpace::ChooseDspWriteSpace => msg.dsp_write_addr,
         ChooseShareSpace::ChooseArmWriteSpace => msg.arm_write_addr,
+        ChooseShareSpace::ChooseLogSpace => msg.dsp_log_addr,
     };
+    
+    msg.mmap_phy_size = match choose {
+        ChooseShareSpace::ChooseDspWriteSpace => msg.dsp_write_size,
+        ChooseShareSpace::ChooseArmWriteSpace => msg.arm_write_size,
+        ChooseShareSpace::ChooseLogSpace => msg.dsp_log_size,
+    };
+
 
     println!("Init sharespace {:?} to 0x{:x}", choose, msg.mmap_phy_addr);
 
@@ -62,7 +71,7 @@ fn choose_sharespace(
     Ok(())
 }
 
-fn sharespace_open() -> Result<OwnedFd, Errno> {
+pub fn sharespace_open() -> Result<OwnedFd, Errno> {
     open(
         "/dev/dsp_debug",
         OFlag::O_RDWR | OFlag::O_SYNC | OFlag::O_NONBLOCK,
@@ -70,8 +79,22 @@ fn sharespace_open() -> Result<OwnedFd, Errno> {
     )
 }
 
+pub fn mmap_log_buffer() -> Mmap {
+    let mut dsp_sharespace = DspSharespace::default();
+    let fd = sharespace_open().unwrap();
+
+    choose_sharespace(
+        &fd,
+        &mut dsp_sharespace,
+        ChooseShareSpace::ChooseLogSpace,
+    )
+    .unwrap();
+
+    unsafe { MmapOptions::new().len(dsp_sharespace.dsp_log_size as usize).map(&fd).unwrap() }
+}
+
 pub struct Sharespace {
-    fd: OwnedFd,
+    pub fd: OwnedFd,
     pub dsp_sharespace: DspSharespace,
     pub write_buffer: MmapMut, // ARM buffer - pu8ArmBuf
 }
@@ -87,7 +110,7 @@ pub fn sharespace_mmap() -> Sharespace {
     )
     .unwrap();
 
-    let write_buffer = unsafe { MmapOptions::new().len(0x1000).map_mut(&fd).unwrap() };
+    let write_buffer = unsafe { MmapOptions::new().len(dsp_sharespace.mmap_phy_size as usize).map_mut(&fd).unwrap() };
 
     Sharespace {
         fd,

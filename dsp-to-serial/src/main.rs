@@ -5,7 +5,7 @@ use std::{
 use serialport::{SerialPort, TTYPort};
 
 use crate::{
-    communication_handler::CommunicationHandler, kbuf::{kbuf_use_new_buf}, msgbox::MsgboxEndpoint, sharespace::{sharespace_mmap}
+    communication_handler::CommunicationHandler, kbuf::{kbuf_use_new_buf}, msgbox::MsgboxEndpoint, sharespace::{sharespace_mmap, mmap_log_buffer}
 };
 
 mod error;
@@ -14,6 +14,42 @@ mod msgbox;
 mod sharespace;
 mod util;
 mod communication_handler;
+
+fn log_tail_thread() {
+    let log_buffer = mmap_log_buffer();
+
+    println!("Log buffer mapped at: {:p}", log_buffer.as_ptr());
+
+    let mut read_ptr = 4;
+
+    loop {
+        let write_ptr = u32::from_le_bytes(log_buffer[0..4].try_into().unwrap()) as usize;
+
+        if write_ptr == read_ptr {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        let process_buffer = |buffer: &[u8]| {
+            for message in buffer.split(|&b| b == 0) {
+                if !message.is_empty() {
+                    println!("DSP_log: {}", String::from_utf8_lossy(message).trim_end());
+                }
+            }
+        };
+
+        if write_ptr > read_ptr {
+            process_buffer(&log_buffer[read_ptr..write_ptr]);
+        } else { // write_ptr < read_ptr, wrapped around
+            process_buffer(&log_buffer[read_ptr..]);
+            process_buffer(&log_buffer[4..write_ptr]);
+        }
+        
+        read_ptr = write_ptr;
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 fn read_dsp(msgbox : &mut MsgboxEndpoint, handler : &mut CommunicationHandler, port: &mut TTYPort) {
     if !msgbox.msgbox_has_signal()
@@ -72,6 +108,9 @@ fn write_dsp(msgbox : &mut MsgboxEndpoint, handler : &mut CommunicationHandler, 
 
 fn main() {
     println!("Hello, world!");
+
+    std::thread::spawn(log_tail_thread);
+
     let mmap = sharespace_mmap();
     println!("Got sharespace mmap!");
     let kbuf = kbuf_use_new_buf(mmap.dsp_sharespace.arm_write_addr).unwrap();
